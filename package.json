@@ -1,0 +1,22 @@
+{
+  "name": "wegmans-mcp",
+  "version": "1.0.0",
+  "description": "Wegmans grocery store MCP server",
+  "main": "dist/index.js",
+  "type": "module",
+  "bin": {
+    "wegmans-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@types/node": "^25.5.2",
+    "typescript": "^6.0.2"
+  }
+}
