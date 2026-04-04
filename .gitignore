@@ -2,5 +2,6 @@ node_modules/
 dist/
 .playwright-mcp/
 traffic.txt
+data/
 .env
 *.log
