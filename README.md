@@ -4,7 +4,7 @@ An MCP (Model Context Protocol) server that lets AI assistants interact with Weg
 
 ## What it does
 
-This server connects to Wegmans' Algolia search API and commerce backend to expose 8 tools:
+This server connects to Wegmans' Algolia search API and commerce backend to expose 12 tools:
 
 | Tool | Auth? | Description |
 |------|-------|-------------|
@@ -15,9 +15,15 @@ This server connects to Wegmans' Algolia search API and commerce backend to expo
 | `get_my_items` | No | Your most frequently purchased items, ranked by purchase frequency |
 | `add_to_cart` | Yes | Add products to your real Wegmans cart |
 | `get_cart` | Yes | View current cart contents |
-| `refresh_my_items` | No | Update purchase history from a browser capture |
+| `refresh_my_items` | No | Update purchase history from a browser capture (legacy) |
+| **`sync_purchase_history`** | **Yes** | **Fetch full purchase history from receipts, orders, and rankings** |
+| **`get_purchase_patterns`** | **No*** | **Analyze how often you buy each item and when you'll need it again** |
+| **`get_shopping_suggestions`** | **No*** | **Smart shopping list — items you likely need, sorted by urgency** |
+| **`get_product_history`** | **No*** | **Full purchase timeline for a specific product** |
 
-The unauthenticated tools work out of the box — no account needed. Cart operations require your Wegmans credentials.
+*\*Reads from local data synced by `sync_purchase_history`.*
+
+The unauthenticated tools work out of the box — no account needed. Cart and sync operations require your Wegmans credentials.
 
 ## Setup
 
@@ -95,7 +101,7 @@ Your customer ID is a UUID that Wegmans assigns to your account. To find it:
 3. Search for any request to `algolia.net`
 4. Look for `userToken` in the request body — that's your customer ID
 
-It looks like: `f2abf2c9-055d-4ca9-b51e-59a702c949c5`
+It looks like: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` (a UUID)
 
 ## Usage examples
 
@@ -169,23 +175,76 @@ An AI assistant can combine `get_my_items` with `add_to_cart` to quickly build y
   ...
 ```
 
-### Refresh your purchase history
+### Purchase intelligence — "What do I need this week?"
 
-Your purchase history is stored locally in `data/my-items.json`. To update it with fresh data from Wegmans:
+The real power: sync your full purchase history, then let the AI figure out what you need.
 
-1. Log into [wegmans.com](https://www.wegmans.com)
-2. Go to [wegmans.com/items](https://www.wegmans.com/items)
-3. Open DevTools → Network tab → filter for `algolia`
-4. Right-click the first `algolia.net` request → **Copy as fetch**
-5. Pass the copied text to `refresh_my_items`
-
-The tool parses the `productID:<score>` patterns from the Algolia request and saves them. Scores represent purchase frequency (higher = more frequently bought).
+**Step 1: Sync your history** (fetches 63+ receipts and 71+ orders from Wegmans)
 
 ```
-> refresh_my_items({ algolia_payload: "fetch(\"https://qgppr19v8v-dsn.algolia.net/...\")" })
+> sync_purchase_history
 
-  Updated my-items: 546 products saved. Top score: 546, lowest: 1.
+  Purchase history synced:
+  - 63 in-store receipts (862 line items)
+  - 71 online orders (1238 line items)
+  - 2100 total purchase events
+  - 818 unique products tracked
 ```
+
+**Step 2: See your patterns**
+
+```
+> get_purchase_patterns({ product_name: "milk" })
+
+  1. [~] Milk, Reduced Fat, 2% Milkfat (Dairy)
+     53 purchases | Every ~7 days | Last: 1d ago | Due in 6d
+
+> get_purchase_patterns({ urgency: "overdue" })
+
+  1. [!!] Clementines, Bagged (Produce) — 68d ago, usually every 26d (42d overdue)
+  2. [!!] Whipped Cream Cheese Spread (Dairy) — 63d ago, usually every 24d (39d overdue)
+  ...
+```
+
+**Step 3: Get a smart shopping list**
+
+```
+> get_shopping_suggestions({ lookahead_days: 7 })
+
+  1. [!!] Clementines, Bagged (Produce) [ID: 44091]
+     Last bought 68 days ago, you usually buy every 26 days (42 days overdue)
+
+  2. [!!] Cream Cheese Icing Cinnamon Rolls (Dairy) [ID: 139106]
+     Last bought 38 days ago, you usually buy every 24 days (15 days overdue)
+
+  3. [!] Bananas, Sold by the Each (Produce) [ID: 92685]
+     Last bought 5 days ago, you usually buy every 8 days (due in 3 days)
+```
+
+**Step 4: Dive into a specific product**
+
+```
+> get_product_history({ product_id: "116893" })
+
+  ## Milk, Reduced Fat, 2% Milkfat (ID: 116893)
+
+  You buy this roughly every 7 days (based on 53 purchases). Last bought 1 day ago.
+
+  Summary: 53 purchases | Total spent: $351.49 | Avg per trip: $6.63
+
+  | Date       | Qty | Price  | Source  | Store |
+  |------------|-----|--------|---------|-------|
+  | 2026-04-04 | 2   | $13.78 | order   | -     |
+  | 2026-03-26 | 1   | $6.89  | order   | -     |
+  | 2026-03-21 | 1   | $6.89  | order   | -     |
+  | ...        |     |        |         |       |
+```
+
+**The killer combo**: Ask an AI assistant "add everything I need this week to my cart" — it calls `get_shopping_suggestions` then `add_to_cart` for each item.
+
+### Legacy: Refresh my-items from browser
+
+The `refresh_my_items` tool still works for updating the Algolia-based frequency ranking. For full purchase history with timestamps and patterns, use `sync_purchase_history` instead.
 
 ## Architecture
 
@@ -196,11 +255,17 @@ src/
   auth.ts               # Azure AD B2C OAuth authentication (PKCE flow)
   cart.ts               # Cart operations (add to cart, get cart, product lookup)
   stores.ts             # Store locator (fetches from wegmans.com/api/stores)
+  receipts.ts           # In-store receipt fetcher (63+ receipts with item detail)
+  orders.ts             # Online order fetcher (71+ orders with line items)
+  my-items-api.ts       # Wegmans My Items API (ranked list with lastPurchasedDate)
+  purchase-history.ts   # Unified data layer — merges all sources, persists locally
+  patterns.ts           # Pure analysis — intervals, predictions, shopping suggestions
   my-items.ts           # Query Algolia for scored product lists
   refresh-my-items.ts   # Parse and save purchase history data
 
 data/
-  my-items.json         # Local cache of purchase history (gitignored)
+  purchase-history.json # Unified purchase timeline (gitignored)
+  my-items.json         # Legacy Algolia-based frequency cache (gitignored)
 
 docs/
   api-reference.md      # Documented Wegmans API endpoints
@@ -212,7 +277,12 @@ docs/
 
 **Cart operations** use Wegmans' commerce API at `api.digitaldevelopment.wegmans.cloud`. Authentication goes through Azure AD B2C with a PKCE OAuth flow — the server handles the full login flow (GET authorize page → POST credentials → GET auth code → exchange for token) and caches the access token until it expires.
 
-**Purchase history** ("my items") is a scored list of product IDs that Wegmans stores server-side and injects into the frontend when you visit `/items`. There's no direct API for it — the data gets embedded in an Algolia query as `productID:12345<score=100>` filter patterns. The `refresh_my_items` tool parses these patterns from a captured request.
+**Purchase intelligence** syncs three API sources:
+- `/commerce/receipts` — 63+ in-store receipts with item-level detail (product, quantity, price, timestamp, store)
+- `/commerce/order/orders/{id}` — 71+ online orders with line items
+- `/commerce/my-items` — ranked product list with `lastPurchasedDate`
+
+These are merged into a unified timeline in `data/purchase-history.json`. The `patterns.ts` module computes per-product purchase intervals using median (robust against outliers), classifies urgency, and generates shopping suggestions. Items you stopped buying are automatically filtered out.
 
 ### Store-aware data
 
@@ -240,10 +310,10 @@ From Wegmans' response headers:
 
 ## Limitations
 
-- **Purchase history requires manual refresh** — The "my items" data lives in your browser session and isn't exposed as a standalone API. You need to capture it from DevTools and pass it to `refresh_my_items` to update.
-- **No order history** — The server can see your purchase frequency scores but not individual past orders.
-- **No coupon management** — The Algolia data includes digital coupon IDs, but clipping/applying coupons is not yet implemented.
+- **No coupon management** — The Algolia data includes digital coupon IDs, and the receipts show discount amounts, but clipping/applying coupons is not yet implemented.
 - **Single fulfillment type per cart** — The cart API ties each cart to one fulfillment type (instore, pickup, or delivery).
+- **Pattern accuracy depends on data** — Products with fewer than 3 purchases don't get interval predictions. Items you stopped buying are filtered out after 3x their usual interval or 90 days, whichever comes first.
+- **Sync is explicit** — You must call `sync_purchase_history` to fetch fresh data. There is no background polling.
 
 ## Prior art
 

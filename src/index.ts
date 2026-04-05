@@ -12,6 +12,8 @@ import { addToCart } from "./cart.js";
 import { queryProductsByIds } from "./my-items.js";
 import { refreshFromPayload } from "./refresh-my-items.js";
 import { getAccessToken } from "./auth.js";
+import { syncPurchaseHistory, loadPurchaseHistory } from "./purchase-history.js";
+import { classifyUrgency, generateShoppingList, getProductInsight } from "./patterns.js";
 
 const server = new McpServer({
   name: "wegmans",
@@ -358,6 +360,295 @@ server.tool(
         content: [{ type: "text", text: `Error: ${msg}` }],
       };
     }
+  }
+);
+
+// ─── Purchase Intelligence Tools ───
+
+server.tool(
+  "sync_purchase_history",
+  "Fetch your complete Wegmans purchase history from in-store receipts, online orders, and purchase rankings. Merges all sources into a local timeline and computes purchase patterns. Run this first to get data, then use get_purchase_patterns or get_shopping_suggestions to analyze.",
+  {},
+  async () => {
+    try {
+      const stats = await syncPurchaseHistory();
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              `Purchase history synced successfully:`,
+              `- ${stats.receiptsCount} in-store receipts (${stats.receiptItemsCount} line items)`,
+              `- ${stats.ordersCount} online orders (${stats.orderItemsCount} line items)`,
+              `- ${stats.totalEvents} total purchase events`,
+              `- ${stats.uniqueProducts} unique products tracked`,
+              ``,
+              `Use get_purchase_patterns, get_shopping_suggestions, or get_product_history to analyze.`,
+            ].join("\n"),
+          },
+        ],
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { content: [{ type: "text", text: `Error syncing: ${msg}` }] };
+    }
+  }
+);
+
+server.tool(
+  "get_purchase_patterns",
+  "Analyze your purchase patterns. Shows how often you buy each item, when you last bought it, and when you'll likely need it again. Useful for 'when did I last buy milk?' or 'how often do I buy eggs?'. Requires sync_purchase_history to have been run first.",
+  {
+    product_name: z
+      .string()
+      .optional()
+      .describe("Filter by product name (partial match, case-insensitive)"),
+    department: z
+      .string()
+      .optional()
+      .describe("Filter by department (e.g. 'Dairy', 'Produce')"),
+    urgency: z
+      .enum(["overdue", "due_soon", "upcoming", "all"])
+      .optional()
+      .describe("Filter by urgency (default: all)"),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(100)
+      .optional()
+      .describe("Max results (default: 25)"),
+  },
+  async ({ product_name, department, urgency, limit }) => {
+    const history = loadPurchaseHistory();
+    if (!history.lastSyncedAt) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "No purchase history found. Run sync_purchase_history first.",
+          },
+        ],
+      };
+    }
+
+    let products = Object.values(history.products);
+
+    // Filter by name
+    if (product_name) {
+      const q = product_name.toLowerCase();
+      products = products.filter((p) =>
+        p.productName.toLowerCase().includes(q)
+      );
+    }
+
+    // Filter by department
+    if (department) {
+      const q = department.toLowerCase();
+      products = products.filter((p) =>
+        p.department.toLowerCase().includes(q)
+      );
+    }
+
+    // Filter by urgency
+    if (urgency && urgency !== "all") {
+      products = products.filter((p) => {
+        const { urgency: u } = classifyUrgency(p);
+        return u === urgency;
+      });
+    }
+
+    // Sort by rank descending (most purchased first), then by last purchase
+    products.sort((a, b) => b.rank - a.rank);
+
+    const count = limit ?? 25;
+    const shown = products.slice(0, count);
+
+    if (shown.length === 0) {
+      return {
+        content: [{ type: "text", text: "No matching products found." }],
+      };
+    }
+
+    const urgencyIcon: Record<string, string> = {
+      overdue: "!!",
+      due_soon: "!",
+      upcoming: "~",
+      not_due: "-",
+      unknown: "?",
+    };
+
+    const lines = shown.map((p, i) => {
+      const { urgency: u, daysSince, daysUntil } = classifyUrgency(p);
+      const interval = p.medianIntervalDays
+        ? `Every ~${Math.round(p.medianIntervalDays)} days`
+        : "Unknown interval";
+      const lastStr = p.lastPurchasedDate
+        ? `Last: ${daysSince}d ago`
+        : "Never";
+      const nextStr =
+        daysUntil !== null
+          ? daysUntil < 0
+            ? `${Math.abs(daysUntil)}d overdue`
+            : daysUntil === 0
+              ? "Due today"
+              : `Due in ${daysUntil}d`
+          : "";
+      return `${i + 1}. [${urgencyIcon[u]}] **${p.productName}** (${p.department})\n   ${p.purchaseDates.length} purchases | ${interval} | ${lastStr} | ${nextStr} [ID: ${p.productId}]`;
+    });
+
+    const syncAge = Math.round(
+      (Date.now() - new Date(history.lastSyncedAt).getTime()) / 60000
+    );
+    const header = `Purchase patterns (${shown.length} of ${products.length} products) | Synced ${syncAge < 60 ? `${syncAge}m ago` : `${Math.round(syncAge / 60)}h ago`}\n\nLegend: !! = overdue, ! = due soon, ~ = upcoming, - = not due, ? = unknown\n`;
+
+    return {
+      content: [{ type: "text", text: header + "\n" + lines.join("\n\n") }],
+    };
+  }
+);
+
+server.tool(
+  "get_shopping_suggestions",
+  "Generate a smart shopping list based on your purchase patterns. Returns items you're likely to need soon, sorted by urgency. Great for 'what do I need this week?' or 'build me a shopping list'. Requires sync_purchase_history to have been run first.",
+  {
+    lookahead_days: z
+      .number()
+      .int()
+      .min(1)
+      .max(30)
+      .optional()
+      .describe("How many days ahead to look (default: 7)"),
+    max_items: z
+      .number()
+      .int()
+      .min(1)
+      .max(50)
+      .optional()
+      .describe("Max suggestions (default: 20)"),
+  },
+  async ({ lookahead_days, max_items }) => {
+    const history = loadPurchaseHistory();
+    if (!history.lastSyncedAt) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "No purchase history found. Run sync_purchase_history first.",
+          },
+        ],
+      };
+    }
+
+    const suggestions = generateShoppingList(history.products, {
+      lookaheadDays: lookahead_days ?? 7,
+      maxItems: max_items ?? 20,
+      includeOverdue: true,
+    });
+
+    if (suggestions.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `No items predicted to be needed in the next ${lookahead_days ?? 7} days.`,
+          },
+        ],
+      };
+    }
+
+    const urgencyIcon: Record<string, string> = {
+      overdue: "!!",
+      due_soon: "!",
+      upcoming: "~",
+      not_due: "-",
+      unknown: "?",
+    };
+
+    const lines = suggestions.map(
+      (s, i) =>
+        `${i + 1}. [${urgencyIcon[s.urgency]}] **${s.productName}** (${s.department}) [ID: ${s.productId}]\n   ${s.reason}`
+    );
+
+    const syncAge = Math.round(
+      (Date.now() - new Date(history.lastSyncedAt).getTime()) / 60000
+    );
+    const header = `Suggested shopping list (next ${lookahead_days ?? 7} days) | ${suggestions.length} items | Synced ${syncAge < 60 ? `${syncAge}m ago` : `${Math.round(syncAge / 60)}h ago`}`;
+
+    return {
+      content: [{ type: "text", text: header + "\n\n" + lines.join("\n\n") }],
+    };
+  }
+);
+
+server.tool(
+  "get_product_history",
+  "Get the complete purchase timeline for a specific product. Shows every time you bought it with dates, quantities, prices. Plus computed pattern summary. Useful for 'show me my milk purchases' or 'how much do I spend on eggs?'.",
+  {
+    product_id: z.string().describe("Wegmans product ID"),
+  },
+  async ({ product_id }) => {
+    const history = loadPurchaseHistory();
+    if (!history.lastSyncedAt) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "No purchase history found. Run sync_purchase_history first.",
+          },
+        ],
+      };
+    }
+
+    const product = history.products[product_id];
+    if (!product) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Product ${product_id} not found in purchase history.`,
+          },
+        ],
+      };
+    }
+
+    // Get events for this product
+    const events = history.events
+      .filter((e) => e.productId === product_id)
+      .sort((a, b) => b.timestamp.localeCompare(a.timestamp)); // newest first
+
+    const insight = getProductInsight(product);
+
+    const totalSpent = events.reduce(
+      (s, e) => s + e.unitPrice * e.quantity,
+      0
+    );
+    const avgPrice =
+      events.length > 0 ? totalSpent / events.length : 0;
+
+    const header = [
+      `## ${product.productName} (ID: ${product_id})`,
+      ``,
+      insight,
+      ``,
+      `**Summary**: ${product.purchaseDates.length} purchases | Total spent: $${totalSpent.toFixed(2)} | Avg per trip: $${avgPrice.toFixed(2)}`,
+    ].join("\n");
+
+    const timeline = events
+      .map((e) => {
+        const date = e.timestamp.slice(0, 10);
+        const price = `$${(e.unitPrice * e.quantity).toFixed(2)}`;
+        return `| ${date} | ${e.quantity} | ${price} | ${e.source} | ${e.storeNumber || "-"} |`;
+      })
+      .join("\n");
+
+    const table = events.length > 0
+      ? `\n### Timeline\n| Date | Qty | Price | Source | Store |\n|------|-----|-------|--------|-------|\n${timeline}`
+      : "\n*No individual purchase events found — last purchase date from My Items API only.*";
+
+    return {
+      content: [{ type: "text", text: header + table }],
+    };
   }
 );
 
