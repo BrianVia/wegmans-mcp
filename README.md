@@ -80,7 +80,16 @@ npm run build
 
 ## Finding your store number
 
-Every Wegmans has a numeric store ID used for pricing, inventory, and aisle locations. Use the `find_stores` tool, or:
+Every Wegmans has a numeric store ID used for pricing, inventory, and aisle locations.
+
+**Common stores:**
+
+| Store | Number |
+|-------|--------|
+| Chantilly, VA (14361 Newbrook Dr.) | `133` |
+| Reston, VA (11950 Hopper St.) | `146` |
+
+Use the `find_stores` tool to look up others, or:
 
 ```
 > find_stores("Reston")
