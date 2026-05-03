@@ -29,8 +29,12 @@ interface CartRequest {
   customerID: string;
 }
 
-interface ExistingLineItem {
-  variant: { sku: string };
+export interface ExistingLineItem {
+  productKey?: string;
+  variant: {
+    sku: string;
+    attributesRaw?: Array<{ name: string; value: unknown }>;
+  };
   name: string;
   quantity: number;
   price: { value: { centAmount: number } };
@@ -39,13 +43,31 @@ interface ExistingLineItem {
   };
 }
 
-interface CartResponse {
+export interface CartResponse {
   grocery?: {
     lineItems: ExistingLineItem[];
     custom?: {
       customFieldsRaw?: Array<{ name: string; value: unknown }>;
     };
   };
+}
+
+export async function getCart(): Promise<CartResponse> {
+  const accessToken = await getAccessToken();
+  const res = await fetch(CART_GET_API, {
+    headers: {
+      authorization: `Bearer ${accessToken}`,
+      accept: "application/json",
+      origin: "https://www.wegmans.com",
+      referer: "https://www.wegmans.com/",
+    },
+  });
+
+  if (!res.ok) {
+    throw new Error(`Failed to fetch cart: ${res.status}`);
+  }
+
+  return (await res.json()) as CartResponse;
 }
 
 function getRequiredEnv(name: string): string {
@@ -99,18 +121,7 @@ async function getCurrentCartLineItems(
   storeNumber: string,
   fulfillmentType: string
 ): Promise<CartLineItem[]> {
-  const res = await fetch(CART_GET_API, {
-    headers: {
-      authorization: `Bearer ${accessToken}`,
-      accept: "application/json",
-      origin: "https://www.wegmans.com",
-      referer: "https://www.wegmans.com/",
-    },
-  });
-
-  if (!res.ok) return [];
-
-  const data = (await res.json()) as CartResponse;
+  const data = await getCart();
   const lineItems = data.grocery?.lineItems ?? [];
 
   const channelSuffix =

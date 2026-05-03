@@ -14,11 +14,94 @@ import { refreshFromPayload } from "./refresh-my-items.js";
 import { getAccessToken } from "./auth.js";
 import { syncPurchaseHistory, loadPurchaseHistory } from "./purchase-history.js";
 import { classifyUrgency, generateShoppingList, getProductInsight } from "./patterns.js";
+import { syncGroceryNote } from "./grocery-sync.js";
 
 const server = new McpServer({
   name: "wegmans",
   version: "1.0.0",
 });
+
+server.tool(
+  "sync_grocery_note",
+  "Parse grocery-note content, compare it against the live Wegmans cart with normalized matching, and add only the missing items. Uses purchase-history preferences first, then search fallback.",
+  {
+    note_content: z
+      .string()
+      .describe("Raw note content from Apple Notes or another grocery list source."),
+    dry_run: z
+      .boolean()
+      .optional()
+      .describe("When true, do not add anything; only report what would be added."),
+    store_number: z.string().optional().describe("Wegmans store number (default: from WEGMANS_STORE env or 133)"),
+    fulfillment: z
+      .enum(["instore", "pickup", "delivery"])
+      .optional()
+      .describe("Fulfillment type (default: instore)"),
+    my_items_limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(200)
+      .optional()
+      .describe("How many purchase-history items to score before falling back to search (default: 75)"),
+  },
+  async ({ note_content, dry_run, store_number, fulfillment, my_items_limit }) => {
+    try {
+      const result = await syncGroceryNote({
+        noteContent: note_content,
+        dryRun: dry_run,
+        storeNumber: store_number,
+        fulfillment,
+        myItemsLimit: my_items_limit,
+      });
+
+      const sections: string[] = [];
+      sections.push(`Parsed ${result.parsedItems.length} grocery item(s).`);
+
+      if (result.alreadyInCart.length > 0) {
+        sections.push(
+          [
+            "Already in cart:",
+            ...result.alreadyInCart.map((item) => {
+              const matches = item.matchedCartItems?.join("; ") ?? "matched cart item";
+              return `- ${item.item} -> ${matches}`;
+            }),
+          ].join("\n")
+        );
+      }
+
+      if (result.added.length > 0) {
+        sections.push(
+          [
+            dry_run ? "Would add:" : "Added:",
+            ...result.added.map((item) => {
+              const target = item.productName ?? item.productId ?? "unknown product";
+              return `- ${item.item} -> ${target}`;
+            }),
+          ].join("\n")
+        );
+      }
+
+      if (result.unresolved.length > 0) {
+        sections.push(
+          [
+            "Unresolved:",
+            ...result.unresolved.map((item) => `- ${item.item} -> ${item.reason}`),
+          ].join("\n")
+        );
+      }
+
+      return {
+        content: [{ type: "text", text: sections.join("\n\n") }],
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        content: [{ type: "text", text: `Error: ${msg}` }],
+      };
+    }
+  }
+);
 
 server.tool(
   "search_products",
